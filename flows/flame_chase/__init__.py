@@ -1,60 +1,114 @@
-"""Flame chase (flowbench: flame_chase) -- two agents take turns on the same task.
+"""Two agents alternate fresh sessions on one workspace with a soft handoff timer.
 
-hmz exec -f official/flame_chase \
-    -a claude/claude-opus-4-8:max -a codex/gpt-5.6-sol:max "$(cat TASK.md)"
-
-Add `-c budget.yaml` with a `budget:` in it to hold this run to something other than what the
-flow comes with, and `hmz -f official/flame_chase -c budget.yaml` opens the interface on the
-same setup.
-
-A run of this can be picked up where the last one left off, and what it keeps is whose turn is
-next, as `turn`, and how many rounds the pair have behind them, as `rounds`. The turn is the
-half of it that has to be kept: a run that always opened at the first agent would hand it the
-turn the other one was owed, and two turns in a row is the one thing a flow whose whole shape
-is two agents alternating must not do. What either of them did is not kept: every turn is a
-session of its own, logged by the backend that ran it, and an agent arriving reads the
-repository rather than a history.
-
-What ends it is the run's allowance, which is humanize's and not this flow's. A loop with
-nothing else to stop it runs until somebody stops it -- a bill nobody agreed to and a week of
-rounds nobody read -- so every session of every agent is held to the hours, the millions of
-output tokens and the dollars the run was given, and a turn taken once that is spent stops the
-run rather than answering. This flow declares ten million output tokens as what it is worth by
-default, which is what it has always come with; whoever runs it says otherwise.
-
-Between the two of them rather than apiece, which it always was and which is now the ordinary
-case rather than this flow's own arithmetic: an allowance is the run's money, and every agent
-of the run spends out of the one reckoning whichever of them was writing at the time.
+Each turn reads the shared repository rather than the previous agent's conversation. At the
+configured boundary the live session is asked to finish only its current operation, write a
+handoff, and return. The timer never kills the operation; returning closes that session and
+starts the other agent in a fresh one.
 """
 
-import time
-from typing import Any
+from __future__ import annotations
 
-from hmz.flows import Agent, Allowance, flow
+import sys
+import threading
+import time
+from typing import Annotated, Any
+
+from hmz.flows import Agent, AgentDefaults, Allowance, Session, flow
+from pydantic import BaseModel, Field
+
+
+class Config(BaseModel):
+    """Cadence for one agent's turn."""
+
+    model_config = {"extra": "forbid"}
+
+    soft_hours: float = Field(
+        default=6.0,
+        ge=0,
+        description=(
+            "Hours before the live agent is asked to finish its in-flight operation, "
+            "write a handoff, and return. Zero disables the reminder."
+        ),
+    )
+
+
+def _handoff_reminder(hours: float) -> str:
+    return f"""Soft work-time reminder: you have been working for about {hours:g} hours in this
+turn. Do not start another validation or experiment. Finish only the operation already in
+flight, preserve the verified results, write a clear handoff for the next agent, and then return
+to end this turn. This is a soft boundary: do not abandon or kill the current operation midway."""
+
+
+def _remind(session: Session, hours: float) -> None:
+    if not session.steers:
+        raise RuntimeError(
+            "the selected backend cannot receive a live handoff reminder"
+        )
+    session.interject(_handoff_reminder(hours))
+
+
+def _run_turn(agent: Agent, task: str, soft_hours: float) -> None:
+    """Run one fresh turn and inject at most one soft handoff reminder."""
+
+    session = agent.new()
+    finished = threading.Event()
+    reminder: threading.Thread | None = None
+
+    if soft_hours:
+
+        def remind() -> None:
+            if finished.wait(soft_hours * 60 * 60):
+                return
+            try:
+                _remind(session, soft_hours)
+                print(
+                    f"flame_chase: soft {soft_hours:g}h handoff reminder delivered",
+                    flush=True,
+                )
+            except (NotImplementedError, RuntimeError, OSError) as exc:
+                print(
+                    "flame_chase: soft handoff reminder could not be delivered: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        reminder = threading.Thread(
+            target=remind,
+            name="flame-chase-soft-handoff",
+            daemon=True,
+        )
+        reminder.start()
+
+    try:
+        session(task, suppress=True)
+    finally:
+        finished.set()
+        session.close()
+        if reminder is not None:
+            reminder.join(timeout=0.1)
 
 
 @flow(budget=Allowance(tokens=33.550336), resumable=True)
 def run(
-    agents: tuple[Agent, Agent],
+    agents: tuple[
+        Annotated[Agent, AgentDefaults(goals=False)],
+        Annotated[Agent, AgentDefaults(goals=False)],
+    ],
     task: str,
+    config: Config | None = None,
     state: dict[str, Any] | None = None,
 ) -> None:
+    """Alternate the two agents until the run allowance stops the flow."""
+
+    held = config or Config()
     kept = state if state is not None else {}
-    at = kept.get("turn", 0) % len(agents)
+    at = int(kept.get("turn", 0)) % len(agents)
     while True:
-        # Which reads the repository, not a history -- and which is where the run's allowance
-        # is read: a turn taken once it is spent raises rather than answering, which is what
-        # ends this loop and is why it needs no exit of its own.
-        agents[at](task, suppress=True)
+        _run_turn(agents[at], task, held.soft_hours)
         at = (at + 1) % len(agents)
         written: dict[str, Any] = {"turn": at}
-        # A round is a turn each, so it is the turn that finishes one that counts it rather
-        # than the turn that opens one: a round the first agent was cut off in is finished by
-        # the run that picks that turn up, and a round finished once is counted once.
         if at == 0:
-            written["rounds"] = kept.get("rounds", 0) + 1
-        # Written once the turn is over rather than before it, and in the one call: a turn
-        # cut short -- the machine went down under it -- is taken again by the agent whose it
-        # was, and what a run leaves says one thing about the round it stopped in.
+            written["rounds"] = int(kept.get("rounds", 0)) + 1
         kept.update(written)
         time.sleep(5)
